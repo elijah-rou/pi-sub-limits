@@ -31,7 +31,7 @@ Run `/reload` in Pi after installing or updating the extension.
 
 ## Browser-backed providers
 
-Cursor and Zen are disabled by default because they read authenticated browser cookies. On Linux they require `sqlite3`, `secret-tool`, and a logged-in Chromium, Google Chrome, or Helium profile. Cookie databases are opened read-only.
+Cursor and Zen are disabled by default because they read authenticated browser cookies. On Linux they require `sqlite3`, `secret-tool`, and a logged-in Chromium, Google Chrome, or Helium Default profile. Cookie databases are opened read-only; only unexpired root-path cookies valid for the exact request host are selected and sent over HTTPS.
 
 Enable Cursor with either:
 
@@ -49,7 +49,12 @@ export PI_SUB_LIMITS_ZEN=1
 mkdir -p ~/.pi/agent && touch ~/.pi/agent/zen-limits.enabled
 ```
 
-An explicit non-empty environment value takes precedence over its marker. Set it to `0` to disable that source.
+An explicit non-empty environment value takes precedence over its marker. Set it to `0` to disable that source. Use one explicit non-Default profile when needed:
+
+```sh
+export PI_SUB_LIMITS_CHROMIUM_COOKIE_DB="$HOME/.config/google-chrome/Profile 1/Cookies"
+export PI_SUB_LIMITS_CHROMIUM_SAFE_STORAGE_APPLICATION=chrome
+```
 
 Zen does not currently expose remaining balance through the model API key. The extension sends only the `auth` or `__Host-auth` cookie to `https://opencode.ai`, blocks redirects, and parses the authenticated workspace billing payload. Override workspace discovery when needed:
 

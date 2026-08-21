@@ -50,6 +50,8 @@ if (typeof moduleApi.registerHooks === "function") {
 }
 
 const {
+	automaticRefreshAllowed,
+	chromiumCookieLookupQuery,
 	chromiumSafeStorageLookupArgs,
 	cursorLimitsEnabled,
 	formatActiveModel,
@@ -58,11 +60,13 @@ const {
 	formatProviderLines,
 	formatQuotaRows,
 	formatResetCountdown,
+	openCodeCookieHosts,
 	packFooterLine,
 	packFooterLinePreserveRight,
 	parseCodexWindows,
 	parseCursorLimits,
 	parseZenBalance,
+	readBoundedResponseText,
 	renderBar,
 	zenLimitsEnabled,
 } = await import("../sub-limits.ts");
@@ -74,6 +78,30 @@ assert.deepEqual(chromiumSafeStorageLookupArgs(), [
 	"xdg:schema",
 	"chrome_libsecret_os_crypt_password_v2",
 ]);
+assert.deepEqual(chromiumSafeStorageLookupArgs("chrome"), [
+	"lookup",
+	"application",
+	"chrome",
+	"xdg:schema",
+	"chrome_libsecret_os_crypt_password_v2",
+]);
+assert.deepEqual(openCodeCookieHosts(), ["opencode.ai", ".opencode.ai"]);
+const cookieQuery = chromiumCookieLookupQuery(["opencode.ai"], ["auth"], 1_000);
+assert.match(cookieQuery, /path = '\/'/);
+assert.match(cookieQuery, /expires_utc = 0 OR expires_utc >/);
+await assert.rejects(
+	readBoundedResponseText(new Response("12345"), 4),
+	/response exceeds 4 bytes/,
+);
+await assert.rejects(
+	readBoundedResponseText(new Response("ok", { headers: { "content-length": "100" } }), 4),
+	/response exceeds 4 bytes/,
+);
+assert.equal(await readBoundedResponseText(new Response("1234"), 4), "1234");
+assert.equal(automaticRefreshAllowed(0, 1_000), true);
+assert.equal(automaticRefreshAllowed(1_000, 60_999), false);
+assert.equal(automaticRefreshAllowed(1_000, 61_000), true);
+assert.equal(automaticRefreshAllowed(61_000, 1_000), true);
 assert.equal(cursorLimitsEnabled("1", false), true);
 assert.equal(cursorLimitsEnabled("0", true), false);
 assert.equal(cursorLimitsEnabled(null, true), true);
@@ -90,6 +118,12 @@ assert.equal(
 	12.5,
 );
 assert.equal(parseZenBalance('{"data":{"customerID":"cus_TEST","balance":750000000}}'), 7.5);
+assert.equal(
+	parseZenBalance(
+		';(($R)=>{$R[0]={balance:9900000000};$R[1]={customerID:"cus_TEST",balance:100000000}})($R)',
+	),
+	1,
+);
 assert.equal(parseZenBalance('<span>Current balance</span><span>$3.25</span>'), 3.25);
 assert.equal(parseZenBalance('{"balance":999999999}'), null);
 assert.equal(parseZenBalance('Account balance $99.00'), null);
@@ -222,7 +256,7 @@ assert.deepEqual(
 		[{ provider: "opencode", short: "zen", windows: [], balanceUsd: 12.5 }],
 		160,
 	);
-	assert.deepEqual(zenLines, ["zen $12.50 remaining"]);
+	assert.deepEqual(zenLines, ["zen $12.50"]);
 	assert.equal(
 		formatLimitsSummary([
 			{ provider: "openai-codex", short: "codex", windows: [{ label: "7d", usedPercent: 6, resetAtMs: null }] },

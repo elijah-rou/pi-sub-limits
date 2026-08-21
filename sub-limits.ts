@@ -36,6 +36,8 @@ const GAUGE_GLYPHS = "▁▂▃▄▅▆▇█";
 const MAX_AUTH_PROVIDERS = 8;
 const MAX_PROVIDERS = 10;
 const REQUEST_TIMEOUT_MS = 10_000;
+const MAX_JSON_RESPONSE_BYTES = 1_048_576;
+const MAX_DASHBOARD_RESPONSE_BYTES = 4_194_304;
 
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 
@@ -48,7 +50,7 @@ const CURSOR_COOKIE_NAME = "WorkosCursorSessionToken";
 const OPENCODE_BASE_URL = "https://opencode.ai";
 const OPENCODE_WORKSPACES_SERVER_ID = "def39973159c7f0483d8793a822b8dbb10d067e12c65455fcb4608459ba0234f";
 const OPENCODE_BILLING_SERVER_ID = "c83b78a614689c38ebee981f9b39a8b377716db85c1fd7dbab604adc02d3313d";
-const OPENCODE_COOKIE_HOSTS = ["opencode.ai", ".opencode.ai", "app.opencode.ai", ".app.opencode.ai"];
+const OPENCODE_COOKIE_HOSTS = ["opencode.ai", ".opencode.ai"];
 const OPENCODE_COOKIE_NAMES = ["auth", "__Host-auth"];
 const OPENCODE_USD_SCALE = 100_000_000;
 const OPENCODE_USER_AGENT =
@@ -57,11 +59,27 @@ const OPENCODE_USER_AGENT =
 
 const CHROMIUM_SAFE_STORAGE_APPLICATION = "chromium";
 const CHROMIUM_SAFE_STORAGE_SCHEMA = "chrome_libsecret_os_crypt_password_v2";
-const CHROMIUM_COOKIE_DATABASES = [
-	join(process.env.HOME || homedir(), ".config", "net.imput.helium", "Default", "Cookies"),
-	join(process.env.HOME || homedir(), ".config", "chromium", "Default", "Cookies"),
-	join(process.env.HOME || homedir(), ".config", "google-chrome", "Default", "Cookies"),
-];
+type ChromiumCookieSource = { database: string; safeStorageApplication: string };
+const customChromiumCookieDatabase = process.env.PI_SUB_LIMITS_CHROMIUM_COOKIE_DB;
+const CHROMIUM_COOKIE_SOURCES: ChromiumCookieSource[] = customChromiumCookieDatabase
+	? [{
+			database: customChromiumCookieDatabase,
+			safeStorageApplication: process.env.PI_SUB_LIMITS_CHROMIUM_SAFE_STORAGE_APPLICATION || "chromium",
+		}]
+	: [
+		{
+			database: join(process.env.HOME || homedir(), ".config", "net.imput.helium", "Default", "Cookies"),
+			safeStorageApplication: "chromium",
+		},
+		{
+			database: join(process.env.HOME || homedir(), ".config", "chromium", "Default", "Cookies"),
+			safeStorageApplication: "chromium",
+		},
+		{
+			database: join(process.env.HOME || homedir(), ".config", "google-chrome", "Default", "Cookies"),
+			safeStorageApplication: "chrome",
+		},
+	];
 const exec = promisify(execFile);
 
 type OAuthCred = {
@@ -97,10 +115,15 @@ type ThemeLike = {
 	bold(text: string): string;
 };
 
+type RefreshResult = { updated: boolean; throttled: boolean; error?: string };
+
 let cached: ProviderLimits[] = [];
 let requestRender: (() => void) | undefined;
 let pollTimer: ReturnType<typeof setInterval> | undefined;
-let inFlight: Promise<void> | undefined;
+let inFlight: Promise<RefreshResult> | undefined;
+let lastRefreshAttemptMs = 0;
+let cacheStale = false;
+let lifecycleGeneration = 0;
 
 export function clampPercent(value: number): number {
 	assertFinite(value, "percent");
@@ -166,6 +189,40 @@ function assert(condition: unknown, message: string): asserts condition {
 
 function assertFinite(value: number, label: string): void {
 	assert(typeof value === "number" && Number.isFinite(value), `${label} must be finite`);
+}
+
+export async function readBoundedResponseText(response: Response, maxBytes: number): Promise<string> {
+	assert(Number.isInteger(maxBytes) && maxBytes > 0 && maxBytes <= 16_777_216, "response byte limit out of bounds");
+	const contentLength = response.headers.get("content-length");
+	if (contentLength) {
+		const declaredBytes = Number(contentLength);
+		if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) {
+			throw new Error(`response exceeds ${maxBytes} bytes`);
+		}
+	}
+	if (!response.body) return "";
+
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let totalBytes = 0;
+	try {
+		for (let chunkCount = 0; chunkCount < 4_096; chunkCount += 1) {
+			const { done, value } = await reader.read();
+			if (done) return Buffer.concat(chunks, totalBytes).toString("utf8");
+			if (!value || value.byteLength === 0) continue;
+			totalBytes += value.byteLength;
+			if (totalBytes > maxBytes) throw new Error(`response exceeds ${maxBytes} bytes`);
+			chunks.push(value);
+		}
+		throw new Error("response chunk count exceeded");
+	} finally {
+		await reader.cancel().catch(() => undefined);
+		reader.releaseLock();
+	}
+}
+
+async function readJsonResponse<T>(response: Response): Promise<T> {
+	return JSON.parse(await readBoundedResponseText(response, MAX_JSON_RESPONSE_BYTES)) as T;
 }
 
 function colorForPercent(theme: ThemeLike, pct: number, text: string): string {
@@ -246,7 +303,7 @@ async function fetchCodexLimits(cred: OAuthCred): Promise<ProviderLimits> {
 	}
 	if (!response.ok) throw new Error(`codex usage ${response.status}`);
 
-	const data = (await response.json()) as CodexUsageResponse;
+	const data = await readJsonResponse<CodexUsageResponse>(response);
 	return {
 		provider: "openai-codex",
 		short: "codex",
@@ -307,11 +364,11 @@ async function fetchAnthropicLimits(cred: OAuthCred): Promise<ProviderLimits> {
 	}
 	if (!response.ok) throw new Error(`anthropic usage ${response.status}`);
 
-	const data = (await response.json()) as {
+	const data = await readJsonResponse<{
 		five_hour?: AnthropicWindow | null;
 		seven_day?: AnthropicWindow | null;
 		seven_day_opus?: AnthropicWindow | null;
-	};
+	}>(response);
 
 	const windows: LimitWindow[] = [];
 	pushAnthropicWindow(windows, "5h", data.five_hour);
@@ -393,17 +450,29 @@ function sqlLiteralList(values: string[]): string {
 	return values.map((value) => `'${value}'`).join(", ");
 }
 
-async function readChromiumCookie(hosts: string[], names: string[]): Promise<ChromiumCookie> {
-	const query =
+export function chromiumCookieLookupQuery(hosts: string[], names: string[], nowMs = Date.now()): string {
+	assertFinite(nowMs, "cookie query time");
+	const chromiumNow = Math.floor((nowMs + 11_644_473_600_000) * 1_000);
+	return (
 		`SELECT hex(host_key) || '|' || hex(name) || '|' || hex(value) || '|' || hex(encrypted_value) ` +
 		`FROM cookies WHERE host_key IN (${sqlLiteralList(hosts)}) AND name IN (${sqlLiteralList(names)}) ` +
-		"ORDER BY last_access_utc DESC LIMIT 1;";
+		`AND path = '/' AND (expires_utc = 0 OR expires_utc > ${chromiumNow}) ` +
+		"ORDER BY last_access_utc DESC LIMIT 1;"
+	);
+}
+
+export function openCodeCookieHosts(): string[] {
+	return [...OPENCODE_COOKIE_HOSTS];
+}
+
+async function readChromiumCookie(hosts: string[], names: string[]): Promise<ChromiumCookie> {
+	const query = chromiumCookieLookupQuery(hosts, names);
 	let lastError: unknown;
 
-	for (const database of CHROMIUM_COOKIE_DATABASES) {
-		if (!existsSync(database)) continue;
+	for (const source of CHROMIUM_COOKIE_SOURCES) {
+		if (!existsSync(source.database)) continue;
 		try {
-			const { stdout } = await exec("sqlite3", ["-readonly", database, query], {
+			const { stdout } = await exec("sqlite3", ["-readonly", source.database, query], {
 				timeout: 5_000,
 				maxBuffer: 16_384,
 			});
@@ -418,7 +487,11 @@ async function readChromiumCookie(hosts: string[], names: string[]): Promise<Chr
 			const value = plainHex
 				? Buffer.from(plainHex, "hex").toString("utf8")
 				: encryptedHex
-					? decryptChromiumCookie(host, encryptedHex, await readChromiumSafeStoragePassword())
+					? decryptChromiumCookie(
+							host,
+							encryptedHex,
+							await readChromiumSafeStoragePassword(source.safeStorageApplication),
+						)
 					: "";
 			assert(value.length > 0, "Chromium cookie value empty");
 			assert(!value.includes("\n"), "Chromium cookie contains newline");
@@ -436,18 +509,21 @@ async function readCursorSessionCookie(): Promise<string> {
 	return (await readChromiumCookie([CURSOR_COOKIE_HOST], [CURSOR_COOKIE_NAME])).value;
 }
 
-export function chromiumSafeStorageLookupArgs(): string[] {
+export function chromiumSafeStorageLookupArgs(
+	application = CHROMIUM_SAFE_STORAGE_APPLICATION,
+): string[] {
+	assert(/^[A-Za-z0-9._-]+$/.test(application), "unsafe Safe Storage application");
 	return [
 		"lookup",
 		"application",
-		CHROMIUM_SAFE_STORAGE_APPLICATION,
+		application,
 		"xdg:schema",
 		CHROMIUM_SAFE_STORAGE_SCHEMA,
 	];
 }
 
-async function readChromiumSafeStoragePassword(): Promise<string> {
-	const { stdout } = await exec("secret-tool", chromiumSafeStorageLookupArgs(), {
+async function readChromiumSafeStoragePassword(application: string): Promise<string> {
+	const { stdout } = await exec("secret-tool", chromiumSafeStorageLookupArgs(application), {
 		timeout: 5_000,
 		maxBuffer: 4_096,
 	});
@@ -483,7 +559,7 @@ async function fetchCursorLimits(): Promise<ProviderLimits> {
 		},
 	});
 	if (!response.ok) throw new Error(`cursor usage ${response.status}`);
-	return parseCursorLimits((await response.json()) as CursorUsageResponse);
+	return parseCursorLimits(await readJsonResponse<CursorUsageResponse>(response));
 }
 
 function finiteNumber(value: unknown): number | null {
@@ -539,13 +615,11 @@ export function parseZenBalance(text: string): number | null {
 		// SolidStart server-function responses are JavaScript rather than JSON.
 	}
 
-	const customerPattern = /(?:^|[,{])\s*(?:"customerID"|customerID)\s*:\s*(?:\$R\[\d+\]\s*=\s*)?"[^"]+"/m;
-	const balancePattern = /(?:^|[,{])\s*(?:"balance"|balance)\s*:\s*(?:\$R\[\d+\]\s*=\s*)?(-?[0-9]+(?:\.[0-9]+)?)/m;
-	if (customerPattern.test(text)) {
-		const balance = balancePattern.exec(text);
-		const rawBalance = finiteNumber(balance?.[1]);
-		if (rawBalance != null) return rawBalance / OPENCODE_USD_SCALE;
-	}
+	const solidCustomerBalance = /(?:^|[,{])\s*(?:"customerID"|customerID)\s*:\s*(?:\$R\[\d+\]\s*=\s*)?"[^"]+"[^{}]{0,512}?(?:"balance"|balance)\s*:\s*(?:\$R\[\d+\]\s*=\s*)?(-?[0-9]+(?:\.[0-9]+)?)/m.exec(
+		text,
+	);
+	const solidRawBalance = finiteNumber(solidCustomerBalance?.[1]);
+	if (solidRawBalance != null) return solidRawBalance / OPENCODE_USD_SCALE;
 
 	const afterLabel = /(?:current\s+balance|zen\s+balance|現在の残高)[\s\S]{0,160}?\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)/i.exec(
 		text,
@@ -582,7 +656,7 @@ async function fetchOpenCodeText(url: string, cookieHeader: string, headers?: Re
 	if (response.status >= 300 && response.status < 400) throw new Error("OpenCode dashboard login expired");
 	if (response.status === 401 || response.status === 403) throw new Error("OpenCode dashboard login expired");
 	if (!response.ok) throw new Error(`OpenCode dashboard ${response.status}`);
-	return response.text();
+	return readBoundedResponseText(response, MAX_DASHBOARD_RESPONSE_BYTES);
 }
 
 async function fetchOpenCodeServerText(
@@ -739,7 +813,7 @@ export function formatProviderLine(
 			? `-$${Math.abs(limits.balanceUsd).toFixed(2)}`
 			: `$${limits.balanceUsd.toFixed(2)}`;
 		return truncateToWidth(
-			theme.fg("dim", `${name} ${amount} remaining`),
+			theme.fg("dim", `${name} ${amount}`),
 			width,
 			theme.fg("dim", "..."),
 		);
@@ -1020,19 +1094,51 @@ export function formatCompactStatuses(statuses: StatusEntry[]): string {
 	return parts.join(" ");
 }
 
-async function refresh(): Promise<void> {
+export function automaticRefreshAllowed(lastAttemptMs: number, nowMs: number): boolean {
+	assertFinite(lastAttemptMs, "last refresh time");
+	assertFinite(nowMs, "refresh time");
+	if (lastAttemptMs <= 0) return true;
+	const elapsedMs = nowMs - lastAttemptMs;
+	return elapsedMs < 0 || elapsedMs >= POLL_MS;
+}
+
+function boundedErrorMessage(error: unknown): string {
+	const message = error instanceof Error ? error.message : String(error);
+	return message.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim().slice(0, 160) || "unknown error";
+}
+
+async function refresh(options?: { force?: boolean; nowMs?: number }): Promise<RefreshResult> {
 	if (inFlight) return inFlight;
-	inFlight = (async () => {
+	const nowMs = options?.nowMs ?? Date.now();
+	assertFinite(nowMs, "refresh time");
+	if (!options?.force && !automaticRefreshAllowed(lastRefreshAttemptMs, nowMs)) {
+		return { updated: false, throttled: true };
+	}
+	lastRefreshAttemptMs = nowMs;
+	const generation = lifecycleGeneration;
+	const operation = (async (): Promise<RefreshResult> => {
 		try {
-			cached = await loadAllLimits();
+			const next = await loadAllLimits();
+			if (generation !== lifecycleGeneration) return { updated: false, throttled: false };
+			cached = next;
+			cacheStale = false;
 			requestRender?.();
-		} catch {
-			// keep prior cache
-		} finally {
-			inFlight = undefined;
+			return { updated: true, throttled: false };
+		} catch (error) {
+			const message = boundedErrorMessage(error);
+			if (generation === lifecycleGeneration) {
+				cacheStale = true;
+				requestRender?.();
+			}
+			return { updated: false, throttled: false, error: message };
 		}
 	})();
-	return inFlight;
+	inFlight = operation;
+	try {
+		return await operation;
+	} finally {
+		if (inFlight === operation) inFlight = undefined;
+	}
 }
 
 function clearPoll(): void {
@@ -1041,9 +1147,13 @@ function clearPoll(): void {
 }
 
 function shutdownUi(): void {
+	lifecycleGeneration += 1;
 	clearPoll();
 	requestRender = undefined;
 	cached = [];
+	inFlight = undefined;
+	lastRefreshAttemptMs = 0;
+	cacheStale = false;
 }
 
 export default function subLimitsExtension(pi: ExtensionAPI) {
@@ -1092,7 +1202,9 @@ export default function subLimitsExtension(pi: ExtensionAPI) {
 					}
 
 					const quotaRows = formatQuotaRows(theme, cached, width);
-					const compactStatuses = formatCompactStatuses(activeModel.statuses);
+					const footerStatuses = [...activeModel.statuses];
+					if (cacheStale) footerStatuses.push(["sub-limits", "limits:stale"]);
+					const compactStatuses = formatCompactStatuses(footerStatuses);
 					const statusText = compactStatuses ? theme.fg("dim", compactStatuses) : "";
 
 					if (quotaRows.length === 1 && statusText) {
@@ -1113,7 +1225,7 @@ export default function subLimitsExtension(pi: ExtensionAPI) {
 			};
 		});
 
-		await refresh();
+		await refresh({ force: true });
 		clearPoll();
 		pollTimer = setInterval(() => {
 			void refresh();
@@ -1138,8 +1250,13 @@ export default function subLimitsExtension(pi: ExtensionAPI) {
 	pi.registerCommand("limits", {
 		description: "Refresh subscription limits and balances now",
 		handler: async (_args, ctx) => {
-			await refresh();
-			ctx.ui.notify(formatLimitsSummary(cached), "info");
+			const result = await refresh({ force: true });
+			const summary = formatLimitsSummary(cached);
+			if (result.error) {
+				ctx.ui.notify(`Refresh failed: ${result.error}. Showing stale data: ${summary}`, "warning");
+				return;
+			}
+			ctx.ui.notify(summary, "info");
 		},
 	});
 }
