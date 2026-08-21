@@ -1,0 +1,26 @@
+{
+  "name": "pi-sub-limits",
+  "version": "0.1.0",
+  "description": "Pi footer extension for subscription quotas and OpenCode Zen balance",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "test": "node --test tests/sub-limits.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run test && npm run typecheck"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@earendil-works/pi-tui": "0.84.2",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "pi": {
+    "extensions": [
+      "./sub-limits.ts"
+    ]
+  }
+}
